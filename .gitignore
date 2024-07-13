@@ -1,4 +1,5 @@
 data/*
+Images/*
 !data/.gitkeep
 
 outputs/
