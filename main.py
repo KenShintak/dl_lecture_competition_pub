@@ -40,8 +40,10 @@ def run(args: DictConfig):
     #       Model
     # ------------------
     model = BasicConvClassifier(
-        train_set.num_classes, train_set.seq_len, train_set.num_channels
+        train_set.num_classes, train_set.seq_len, train_set.num_channels,flag=0
     ).to(args.device)
+    path_pre_train_model = "/content/drive/MyDrive/ColabData/dl_lecture_competition_pub/data/model/after_7_epoch_pretrain_model.pt"
+    model.load_state_dict(torch.load(path_pre_train_model))
 
     # ------------------
     #     Optimizer
@@ -62,12 +64,15 @@ def run(args: DictConfig):
         train_loss, train_acc, val_loss, val_acc = [], [], [], []
         
         model.train()
-        for X, y, subject_idxs in tqdm(train_loader, desc="Train"):
+        for X, y, subject_idxs, image_paths in tqdm(train_loader, desc="Train"):
             X, y = X.to(args.device), y.to(args.device)
 
             y_pred = model(X)
-            
-            loss = F.cross_entropy(y_pred, y)
+
+            l2 = torch.tensor(0.0, requires_grad=True)
+            for param in model.parameters():
+              l2 = l2 + torch.norm(param)**2
+            loss = F.cross_entropy(y_pred, y) + args.alpha*l2
             train_loss.append(loss.item())
             
             optimizer.zero_grad()
@@ -78,13 +83,19 @@ def run(args: DictConfig):
             train_acc.append(acc.item())
 
         model.eval()
-        for X, y, subject_idxs in tqdm(val_loader, desc="Validation"):
+        for X, y, subject_idxs, image_paths in tqdm(val_loader, desc="Validation"):
             X, y = X.to(args.device), y.to(args.device)
             
             with torch.no_grad():
                 y_pred = model(X)
             
-            val_loss.append(F.cross_entropy(y_pred, y).item())
+            l2 = torch.tensor(0.0, requires_grad=True)
+            for param in model.parameters():
+              l2 = l2 + torch.norm(param)**2
+
+            loss = F.cross_entropy(y_pred, y) + args.alpha*l2
+
+            val_loss.append(loss.item())
             val_acc.append(accuracy(y_pred, y).item())
 
         print(f"Epoch {epoch+1}/{args.epochs} | train loss: {np.mean(train_loss):.3f} | train acc: {np.mean(train_acc):.3f} | val loss: {np.mean(val_loss):.3f} | val acc: {np.mean(val_acc):.3f}")
