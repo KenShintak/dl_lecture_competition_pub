@@ -1,0 +1,127 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops.layers.torch import Rearrange
+from scipy.signal import savgol_filter
+import numpy as np
+import os
+import clip
+from transformers import CLIPProcessor, CLIPModel
+
+image_dir = [
+    f for f in os.listdir("/content/drive/MyDrive/ColabData/dl_lecture_competition_pub/data/Images") if os.path.isdir(os.path.join("/content/drive/MyDrive/ColabData/dl_lecture_competition_pub/data/Images", f))
+]
+label = sorted(image_dir) #1854のリスト
+
+clip_model, preprocess = clip.load("ViT-B/32", device="cuda:0", jit=False)
+save_path = "/content/drive/MyDrive/ColabData/dl_lecture_competition_pub/data/my_finetuned_clip.pt"
+clip_model.load_state_dict(torch.load(save_path))
+
+text_inputs = torch.cat([clip.tokenize(word) for word in label]).cuda()
+
+with torch.no_grad():
+    text_features = clip_model.encode_text(text_inputs) #ラベルの特徴量、1854x512
+
+def cos_sim(v1, v2):
+  v1 = v1.float()
+  v2 = v2.float()
+  return torch.dot(v1, v2) / (torch.norm(v1, p=2) * torch.norm(v2, p=2))
+
+def return_cos_sim(a,b): #a:ラベルのclip空間上特徴量1854x512, b:予測モデルencoder出力b x 512
+  c = torch.empty(len(b), len(a))
+  for i in range(len(b)):
+    for j in range(len(a)):
+      c[i, j] = cos_sim(a[j], b[i])
+  return c #b x 1854
+
+class BasicConvClassifier(nn.Module):
+    def __init__(
+        self,
+        num_classes: int,
+        seq_len: int,
+        in_channels: int,
+        hid_dim: int = 256,
+        z_dim=512,
+        flag=0
+    ) -> None:
+        super().__init__()
+        self.num_classes = num_classes
+        self.seq_len = seq_len
+        self.in_channels = in_channels
+        self.hid_dim = hid_dim
+        self.z_dim = z_dim
+        self.flag = flag
+
+        self.blocks = nn.Sequential(
+            ConvBlock(in_channels, hid_dim),
+            ConvBlock(hid_dim, hid_dim),
+        )
+
+        self.z_head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            Rearrange("b d 1 -> b d"),
+            nn.Linear(hid_dim, z_dim),
+        )
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        """_summary_
+        Args:
+            X ( b, c, t ): _description_
+        Returns:
+            X ( b, num_classes ): _description_
+        """
+        #平滑化
+        X_cpu = X.cpu()
+        X = savgol_filter(X_cpu.numpy(), window_length=10, polyorder=2) #numpy
+
+        #minとmaxでスケーリング
+        X = torch.from_numpy((X - np.min(X, axis=2, keepdims=True)) / (np.max(X, axis=2, keepdims=True) - np.min(X, axis=2, keepdims=True))).cuda()
+        
+        #ベースライン補正
+        mean_in_start = torch.mean(X[:,:,:25], dim=2, keepdim=True)
+        X = X - mean_in_start
+
+        X = self.blocks(X)
+        z = self.z_head(X)
+
+        if self.flag == 1:
+          return z #b x 512
+        else:
+          output = return_cos_sim(text_features, z)
+          return output # b x 1854
+
+
+class ConvBlock(nn.Module):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        kernel_size: int = 3,
+        p_drop: float = 0.3,
+    ) -> None:
+        super().__init__()
+        
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+
+        self.conv0 = nn.Conv1d(in_dim, out_dim, kernel_size, padding="same")
+        self.conv1 = nn.Conv1d(out_dim, out_dim, kernel_size, padding="same")
+        #self.conv2 = nn.Conv1d(z_dim, out_dim, kernel_size, padding="same")
+        
+        self.batchnorm0 = nn.BatchNorm1d(num_features=out_dim)
+        self.batchnorm1 = nn.BatchNorm1d(num_features=out_dim)
+
+        self.dropout = nn.Dropout(p_drop)
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        if self.in_dim == self.out_dim:
+            X = self.conv0(X) + X  # skip connection
+        else:
+            X = self.conv0(X)
+
+        X = F.gelu(self.batchnorm0(X))
+
+        X = self.conv1(X)
+        z = F.gelu(self.batchnorm1(X))
+
+        return self.dropout(z)
